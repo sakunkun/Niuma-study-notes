@@ -38,16 +38,20 @@ Qwen3 Embedding 系列支持超过 100 种语言，涵盖主流自然语言及�
 | Text Reranking | Qwen3-Reranker-0.6B | 0.6B | 28 | 32K | - | - | Yes |
 | Text Reranking | Qwen3-Reranker-4B | 4B | 36 | 32K | - | - | Yes |
 | Text Reranking | Qwen3-Reranker-8B | 8B | 36 | 32K | - | - | Yes |
+
 注：MRL Support 表示 Embedding 模型是否支持最终向量的自定义维度。Instruction Aware 表示 Embedding 或 Reranking 模型是否支持根据不同任务定制输入指令。
 
 ## 模型架构
 Qwen3 Embedding 系列模型基于 Qwen3 基础模型开发，采用两种不同的架构设计：
 
+![Qwen3 Embedding Architecture](Qwen3-embedding-reranker-struct.png)
+
 ### Embedding 模型架构
-- 采用双塔结构设计
+- 采用双塔结构设计（一个塔处理 Query，一个塔处理 Document）
 - 通过 LoRA 微调保留基础模型的文本理解能力
-- 输入：单段文本
-- 输出：使用最后一层 [EOS] 标记的隐藏状态向量作为文本的语义表示
+- 同一权重支持多分辨率向量（MRL）：768、1024、4096 等维度可动态裁剪，方便在边缘或服务器侧按需部署。
+- 输入：Query是把 Instruction + Query 拼成一条序列（Instruction可自定义）。Document则保持不变。
+- 输出：使用最后一层 [EOS] 标记的隐藏状态向量作为文本的语义，表示没有额外池化头，推理路径更短。
 ```python
 # 0.6B 参数规模的 Embedding 模型架构
 Qwen3Model(
@@ -80,7 +84,7 @@ Qwen3Model(
 ### Reranking 模型架构
 - 采用单塔结构设计
 - 输入：文本对（如用户查询与候选文档）
-- 输出：两个文本之间的相关性得分
+- 输出：两个文本之间的相关性得分。把相关性判定写成“yes/no”二分类提示，只看下一 token 的两项概率即可得到打分，接口简单，延迟低。
 ```python
 # 0.6B 参数规模的 Reranking 模型架构
 Qwen3ForCausalLM(
@@ -112,6 +116,3 @@ Qwen3ForCausalLM(
   (lm_head): Linear(in_features=1024, out_features=151669, bias=False)
 )
 ```
-
-
-这种架构设计使得模型能够高效地完成文本表征和相关性排序任务。
