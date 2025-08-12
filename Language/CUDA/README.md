@@ -1,0 +1,1 @@
+目前还在入门阶段，学习资料主要是Programming Massively Parallel Processors这本书。
