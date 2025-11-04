@@ -2,7 +2,7 @@
 
 (TODO：目前的水平只能通过阅读源码获取一个大致流程，后续一些技术细节还得再研究，这篇文档目前只考虑单机的情况)
 随着attention的花活越来越多，比如chunked prefill, tree attention, paged attention等，里面复杂的分支、条件判断，变来变去的kv cache，使得其很难捕获cuda graph。
-vLLM在v1时引入了Piecewise CUDA Graphs，沿着attention将模型切成各个子graph，实际运行时非attention部分可以很好的捕获成cuda graph以加速运行，而attention部分则以eager mode方式运行。
+vLLM在v1时引入了Piecewise CUDA Graphs，沿着attention将模型切成各个sub mod，实际运行时非attention部分可以很好的捕获成cuda graph以加速运行，而attention部分则以eager mode方式运行。
 在略微降低处理速度的情况下，极大降低了attention部分的开发难度，使得更多复杂的特性可以被实现。
 
 ![Piecewise CUDA Graphs](image/peicewise_cuda_graph.png)
@@ -56,8 +56,8 @@ vLLM编译相关的配置记录在`vllm.config.CompilationConfig`中，这里主
 
 ## 整体流程
 大体上分为两部分：
-1. **torch.compile**：模型在定义时forward就被torch.compile包裹住了，在首次执行（profile_run,用于确定可用显存）时，GraphModule的分片，片段的编译就完成了，每个compiled_graph都会保存在CUDAPiecewiseBackend等着后续执行。
-2. **cuda graph捕获**：按照cudagraph_capture_sizes里从大到小的尺寸一次捕获cuda graph，CUDAPiecewiseBackend控制捕获和执行流程。
+1. **torch.compile**：模型在定义时forward就被torch.compile包裹住了，在首次执行（profile_run,用于确定可用显存）时，GraphModule的分片、子图的编译就完成了，每个compiled_graph都会保存在PiecewiseBackend等着后续执行。
+2. **cuda graph捕获**：按照cudagraph_capture_sizes里从大到小的尺寸一次捕获cuda graph，CUDAGraphWrapper控制捕获和执行流程。
 
 ### torch.compile部分
 
@@ -425,7 +425,9 @@ class VllmBackend:
         # 保存原始图
         # ===================================
         self.graph = graph
-        # 配写inductor的option参数
+        # 配置inductor的option参数
+        # 这里会注册一个PostGradPassManager钩子，在inductor梯度计算后触发，会对计算图进行一系列优化
+        # 包括算子融合、并行化、消除冗余操作等，以提高模型推理性能
         self.configure_post_pass()
 
         # ===================================
@@ -542,6 +544,10 @@ def split_graph(graph: fx.GraphModule,
 
     return split_gm, outputs
 ```
+注意：部分attention后端在不同场景下（decode或decode+prefill）会调用不同kernel，vllm会将attention的实现包装成一个不透明的custom op注册vllm自己的lib里，上层的torch.compile只能看到这个custom op，如torch.ops.vllm.unified_attention_with_output，看不到内部实现。这样有两个好处：
+1. 可以灵活适配不同的attention后端
+2. 不会因为运行时attention内部的kernel切换导致torch.compile重新编译（这确保了full cudagraph和piecewise cudagraph可以共用一个编译后的图）
+
 **编译部分**
 
 vllm/compilation/backends.py里的PiecewiseCompileInterpreter是自定义的Interpreter，用于执行拆分后的子图，对非attention的子图会调用inductor编译。编译后的子图会封装在piecewise_backend替换原来的，后续实际的执行单元就是piecewise_backend。
@@ -623,6 +629,61 @@ class PiecewiseCompileInterpreter(torch.fx.Interpreter):
 
         return output
 ```
+
+**算子融合**
+vllm利用inductor的post_grad_custom_post_pass钩子注册了自己的PostGradPassManager，在inductor梯度计算后触发，会对计算图进行一系列优化，包括算子融合、并行化、消除冗余操作等，以提高模型推理性能。
+PostGradPassManager里包含一系列pass，主要包含：
+
+```python
+    def configure(self, config: VllmConfig):
+        self.pass_config = config.compilation_config.pass_config
+        if self.pass_config.enable_noop:
+            self.passes += [NoOpEliminationPass(config)] # 消除冗余操作
+
+        if self.pass_config.enable_sequence_parallelism:
+            self.passes += [SequenceParallelismPass(config)] # 并行化
+            if self.pass_config.enable_async_tp:
+                self.passes += [AsyncTPPass(config)] # 异步TP
+
+        if self.pass_config.enable_fusion:
+            self.passes += [FusionPass.instance(config)] # 算子融合
+            self.passes += [ActivationQuantFusionPass(config)] # 激活量化融合
+
+        if self.pass_config.enable_attn_fusion:
+            self.passes += [AttnFusionPass(config)] # 注意力算子融合
+        if self.pass_config.enable_fi_allreduce_fusion:
+            self.passes += [AllReduceFusionPass(config)] # Allreduce融合
+        self.fix_functionalization = FixFunctionalizationPass(config) # 修复函数化
+```
+
+以RMSNorm+FP8量化融合为例，vLLM使用PyTorch的pattern matcher进行模式匹配和替换：
+```python
+class FusedAddRMSNormStaticQuantPattern(RMSNormQuantPattern):
+    def register(self, pm_pass: PatternMatcherPass, record_match: Callable):
+        def pattern(result: torch.Tensor, input: torch.Tensor, residual: torch.Tensor,
+                   weight: torch.Tensor, scale: torch.Tensor):
+            # 原始模式：先做fused_add_rms_norm，再做量化
+            at = auto_functionalized(RMS_ADD_OP, input=input, residual=residual,
+                                   weight=weight, epsilon=self.epsilon)
+            at1 = auto_functionalized(self.QUANT_OP, result=result, input=at[1], scale=scale)
+            return at1[1], at[2]  # result, residual
+        
+        def replacement(result: torch.Tensor, input: torch.Tensor, residual: torch.Tensor,
+                       weight: torch.Tensor, scale: torch.Tensor):
+            # 融合后的模式：一个算子完成所有操作
+            at = auto_functionalized(self.FUSED_OP, result=result, input=input,
+                                   residual=residual, weight=weight, scale=scale,
+                                   epsilon=self.epsilon)
+            return at[1], at[2]  # result, residual
+        
+        pm.register_replacement(pattern, replacement, inputs, pm.fwd_only, pm_pass,
+                              extra_check=lambda m: record_match(self.Match(m, self.QUANT_OP, self.FUSED_OP)))
+```
+
+这里的关键技术点：
+1. 使用[`auto_functionalized`](./auto_functionalized.md)包装原地操作，确保函数式编程语义（与之对应的有去函数化操作[`FixFunctionalizationPass`](./FixFunctionalizationPass.md)）
+2. 通过extra_check回调记录匹配，支持多输出模式的手动处理
+3. 定义了完整的输入输出映射关系
 
 这样下来，第一次前向触发的编译工作就完成了，整体的流程就如下图所示
 ![Compile](image/compile.drawio.png)
